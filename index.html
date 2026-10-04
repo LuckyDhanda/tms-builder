@@ -880,6 +880,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const zip = await JSZip.loadAsync(templateBuf);
     const wbXml = await zip.file('xl/workbook.xml').async('string');
     const relsXml = await zip.file('xl/_rels/workbook.xml.rels').async('string');
+    let rels = relsXml, ct = await zip.file('[Content_Types].xml').async('string');
     const sheetTags = [...wbXml.matchAll(/<sheet\b[^>]*>/g)].map((m) => m[0]);
     const attr = (tag, a) => { const m = tag.match(new RegExp(`\\b${a}="([^"]*)"`)); return m && m[1]; };
     const unesc = (s) => s.replace(/&amp;/g, '&').replace(/&apos;/g, "'").replace(/&quot;/g, '"');
@@ -902,10 +903,15 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     };
     if (!style.A) style.A = addXf(14);
     for (const c of ['H', 'I', 'J']) if (!style[c]) style[c] = style.H || addXf(21);
-    const fG = (sx.match(/<c r="G\d+"[^>]*>\s*<f>([^<]*XLOOKUP[^<]*)<\/f>/) || [])[1];
-    const gFormula = (n) => fG ? fG.replace(/\(F\d+,/, `(F${n},`) : `_xlfn.XLOOKUP(F${n},'4. TMS Task per Submission'!$B$2:$B$33,'4. TMS Task per Submission'!$C$2:$C$33)`;
+    // Key Stage: same lookup as the template's XLOOKUP, written so every Excel version can calculate it
+    const gFormula = (n) => `IFERROR(INDEX('4. TMS Task per Submission'!$C$2:$C$33,MATCH(F${n},'4. TMS Task per Submission'!$B$2:$B$33,0)),"")`;
     const sAttr = (c) => style[c] ? ` s="${style[c]}"` : '';
-    const str = (c, n, v) => `<c r="${c}${n}"${sAttr(c)} t="inlineStr"><is><t xml:space="preserve">${xmlEsc(v)}</t></is></c>`;
+    // text goes into the shared strings table, the way Excel itself stores it
+    let sst = zip.file('xl/sharedStrings.xml') ? await zip.file('xl/sharedStrings.xml').async('string') : null;
+    const sstBase = sst ? (sst.match(/<si>|<si\s/g) || []).length : 0;
+    const sstNew = new Map(); let sstRefs = 0;
+    const sIdx = (v) => { v = String(v); if (!sstNew.has(v)) sstNew.set(v, sstBase + sstNew.size); sstRefs++; return sstNew.get(v); };
+    const str = (c, n, v) => `<c r="${c}${n}"${sAttr(c)} t="s"><v>${sIdx(v)}</v></c>`;
     const keyStage = new Map(TASKS);
 
     let body = '';
@@ -939,14 +945,29 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     sx = sx.replace(/<autoFilter ref="A1:([A-Z]+)\d+"/, `<autoFilter ref="A1:$1${last}"`);
     zip.file(target, sx);
     zip.file('xl/styles.xml', stylesXml);
+    const sis = [...sstNew.keys()].map((v) => `<si><t xml:space="preserve">${xmlEsc(v)}</t></si>`).join('');
+    if (sst) {
+      const oldCount = +((sst.match(/<sst\b[^>]*\bcount="(\d+)"/) || [])[1] || sstBase);
+      sst = sst.replace(/<sst\b[^>]*>/, (t) => {
+        t = t.replace(/\s(count|uniqueCount)="\d+"/g, '');
+        return t.replace(/\/?>$/, (end) => ` count="${oldCount + sstRefs}" uniqueCount="${sstBase + sstNew.size}"${end}`);
+      });
+      sst = /<sst\b[^>]*\/>/.test(sst) ? sst.replace(/<sst\b([^>]*)\/>/, `<sst$1>${sis}</sst>`) : sst.replace('</sst>', sis + '</sst>');
+    } else {
+      sst = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${sstRefs}" uniqueCount="${sstNew.size}">${sis}</sst>`;
+      ct = ct.replace('</Types>', '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>');
+      rels = rels.replace('</Relationships>', '<Relationship Id="rIdTmsSst" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>');
+    }
+    zip.file('xl/sharedStrings.xml', sst);
 
     // drop the stale calculation chain and ask Excel to recalculate on open
     if (zip.file('xl/calcChain.xml')) {
       zip.remove('xl/calcChain.xml');
-      const ct = await zip.file('[Content_Types].xml').async('string');
-      zip.file('[Content_Types].xml', ct.replace(/<Override[^>]*calcChain[^>]*\/>/, ''));
-      zip.file('xl/_rels/workbook.xml.rels', relsXml.replace(/<Relationship[^>]*calcChain[^>]*\/>/, ''));
+      ct = ct.replace(/<Override[^>]*calcChain[^>]*\/>/, '');
+      rels = rels.replace(/<Relationship[^>]*calcChain[^>]*\/>/, '');
     }
+    zip.file('[Content_Types].xml', ct);
+    zip.file('xl/_rels/workbook.xml.rels', rels);
     let wb2 = wbXml;
     if (/<calcPr\b/.test(wb2)) wb2 = wb2.replace(/<calcPr\b([^>]*?)(\/?)>/, (m, a, sl) => `<calcPr${a.replace(/\sfullCalcOnLoad="[^"]*"/, '')} fullCalcOnLoad="1"${sl}>`);
     else wb2 = wb2.replace('</workbook>', '<calcPr fullCalcOnLoad="1"/></workbook>');
@@ -1277,7 +1298,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   function outName() {
     const base = state.template.name.replace(/\.xls[xm]$/i, '');
     const mName = C.MONTH_NAMES[state.month - 1];
-    const re = /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec)\b/i;
+    const re = /(?<![a-z])(january|february|march|april|may|june|july|august|september|october|november|december|sept|sep|jan|feb|mar|apr|jun|jul|aug|oct|nov|dec)(?![a-z])/i;
     return (re.test(base) ? base.replace(re, mName) : `${base} ${mName} ${state.year}`) + '.xlsx';
   }
   $('#download').addEventListener('click', async () => {
